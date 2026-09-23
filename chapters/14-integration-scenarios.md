@@ -1,6 +1,6 @@
 # 14 軌道業者系統介接情境：會遇到的問題與 Kong 的應對
 
-本章以一個軌道業者的新會計系統為例，把前面各章的政策套到實際會碰到的介接上：外部協力廠商 → WAF → Kong → 會計系統；運務／工務／機務／電務／票務等內部系統 → Kong → 會計系統。系統與協定為示意（例如票務採既有 SOAP/XML Web Service），**實際介面以各專案的介面清單為準**。每個情境分三段：會遇到的問題 → Kong 怎麼應對 → Kong 做不到、要誰做。最後一段是不分系統的共通做法。
+本章以一個軌道業者的新會計系統為例，把前面各章的政策套到實際會碰到的介接上：外部協力廠商 → WAF → Kong → 會計系統；運務／工務／機務／電務／票務等內部系統 → Kong → 會計系統。系統與協定為示意（例如票務採既有 SOAP/XML Web Service），**實際介面以各專案的介面清單為準**。每個情境：情境與影響 → 會遇到的問題 → Kong 怎麼應對（每條標 `標準` 或 `客製`，定義同第 13 章）→ Kong 做不到、要誰做。最後一段是不分系統的共通做法。
 
 {% hint style="info" %}
 先講結論：Kong 在這些介接裡負責的是**認證、限流、逾時與斷路、輕量轉換、留痕**五件事。資料對映、去重、業務規則、檔案格式與加簽，一律在後端或轉接服務做。把這條線畫清楚，後面每一題都好答。
@@ -20,6 +20,8 @@
 
 **情境**：票務每日把營收、退票、沖銷資料送會計；會計偶爾回查單筆交易。票務只講 SOAP/XML，會計（Maximo）的 OSLC/REST 只收 JSON。
 
+**影響**：轉換失敗＝當日營收進不了帳；重送＝重複認列要沖銷；批次逾時＝隔天人工補跑；個資進 log＝稽核缺失。
+
 ### 會遇到的問題
 
 - 協定不合：SOAP envelope、命名空間、WSDL 版本差異；Kong 核心與 Request Transformer Advanced 的 body 轉換**只處理 application/json，不解析 XML**。
@@ -29,10 +31,10 @@
 
 ### Kong 怎麼應對
 
-- **轉換兩條路**。A：閘道掛 XSLT 型轉換插件（Kong CX 團隊的 `soap-rest-converter`，依 libxslt，XSLT 2.0 的 json-to-xml／xml-to-json），適合欄位對映固定、單一 WSDL 的介面。B：票務 → Kong → 轉接服務（XML→JSON 微服務）→ 會計，適合多版本 WSDL、要查表或多步驟。建議先 B 求穩，穩定的介面再收斂到 A。兩條路閘道都負責認證、限流、留痕。
-- **強制冪等鍵**：批次路由掛 pre-function（OSS）或 request-validator `Enterprise`，沒帶 `Idempotency-Key` 直接 400；去重本體在會計端以鍵查重。注意 Kong 的 retries 對「已送出的 POST」不重送，閘道重試補救不了這題。
-- **批次獨立 Service**：`read_timeout 300000`、request-size-limiting 20 MB；一般路由維持 60 秒／1 MB。請票務改分頁分批（每批 500 筆）並接受 202 非同步回執。
-- **遮罩**：http-log 的 `custom_fields_by_lua` 把身分證、卡號欄位改寫為遮罩值；批次路由不掛 response-transformer（大回應會全部緩衝進記憶體）。
+- `標準` `客製` **轉換兩條路**。A：閘道掛 XSLT 型轉換插件（Kong CX 團隊的 `soap-rest-converter`，依 libxslt，XSLT 2.0 的 json-to-xml／xml-to-json），適合欄位對映固定、單一 WSDL 的介面。B：票務 → Kong → 轉接服務（XML→JSON 微服務）→ 會計，適合多版本 WSDL、要查表或多步驟。建議先 B 求穩，穩定的介面再收斂到 A。兩條路閘道都負責認證、限流、留痕。
+- `標準` `客製` **強制冪等鍵**：批次路由掛 pre-function（OSS）或 request-validator `Enterprise`，沒帶 `Idempotency-Key` 直接 400；去重本體在會計端以鍵查重。注意 Kong 的 retries 對「已送出的 POST」不重送，閘道重試補救不了這題。
+- `標準` **批次獨立 Service**：`read_timeout 300000`、request-size-limiting 20 MB；一般路由維持 60 秒／1 MB。請票務改分頁分批（每批 500 筆）並接受 202 非同步回執。
+- `標準` **遮罩**：http-log 的 `custom_fields_by_lua` 把身分證、卡號欄位改寫為遮罩值；批次路由不掛 response-transformer（大回應會全部緩衝進記憶體）。
 
 ### Kong 做不到、要誰做
 
@@ -78,6 +80,8 @@ services:
 
 **情境**：每個系統最後都打會計的 OSLC/REST（`/maximo/api/os/<物件結構>`）。它是整個架構的樞紐，也是雪崩時第一個倒的。
 
+**影響**：繞道＝限流與稽核失效；尖峰＝日結延誤；ui／api 混用＝使用者操作卡頓；403 誤判＝呼叫方無限重試放大負載。
+
 ### 會遇到的問題
 
 - 繞道：內部系統拿到 Manage 網址就直連，限流與稽核形同虛設。
@@ -88,13 +92,13 @@ services:
 
 ### Kong 怎麼應對
 
-- **只指 api bundle**：部署時獨立出 api bundle，Upstream 指它的 Service，不指 all／ui；主動健康檢查用 `/maximo/api/ping`（不需登入、回 200，實測），被動檢查 5xx 與逾時；演算法 least-connections。
-- **路徑白名單**：對系統只開 `/maximo/api/…`，`/maximo/oslc/…` 與 `/maximo/ui` 不建 Route。
-- **兩層憑證**：呼叫方用 Kong 的 key-auth（`hide_credentials` 剝掉），Kong 依 consumer 用 request-transformer 補上該系統專屬的 Maximo `apikey`（值放 Vault）。Maximo 的金鑰不離開閘道，輪替只改一處。
-- **分級限流**：consumer group 綁 rate-limiting-advanced `Enterprise`，財務類系統高額度、查詢類低額度；日結窗口前 24 小時凍結閘道設定（CI 不 sync）。
-- **參考資料快取**：科目、成本中心、幣別這類 GET 掛 proxy-cache（TTL 5–15 分鐘）。
-- **強制分頁**：pre-function 檢查清單 GET 必帶 `oslc.pageSize` 且 ≤ 200，否則 400。
-- **防繞道**：Manage 命名空間的 NetworkPolicy 只允許 Kong DP 的 pod 進 api bundle 埠，其他一律拒絕。這是唯一有效的方法，閘道自己擋不了繞道。
+- `標準` **只指 api bundle**：部署時獨立出 api bundle，Upstream 指它的 Service，不指 all／ui；主動健康檢查用 `/maximo/api/ping`（不需登入、回 200，實測），被動檢查 5xx 與逾時；演算法 least-connections。
+- `標準` **路徑白名單**：對系統只開 `/maximo/api/…`，`/maximo/oslc/…` 與 `/maximo/ui` 不建 Route。
+- `標準` **兩層憑證**：呼叫方用 Kong 的 key-auth（`hide_credentials` 剝掉），Kong 依 consumer 用 request-transformer 補上該系統專屬的 Maximo `apikey`（值放 Vault）。Maximo 的金鑰不離開閘道，輪替只改一處。
+- `標準` **分級限流**：consumer group 綁 rate-limiting-advanced `Enterprise`，財務類系統高額度、查詢類低額度；日結窗口前 24 小時凍結閘道設定（CI 不 sync）。
+- `標準` **參考資料快取**：科目、成本中心、幣別這類 GET 掛 proxy-cache（TTL 5–15 分鐘）。
+- `客製` **強制分頁**：pre-function 檢查清單 GET 必帶 `oslc.pageSize` 且 ≤ 200，否則 400。
+- `客製` **防繞道**：Manage 命名空間的 NetworkPolicy 只允許 Kong DP 的 pod 進 api bundle 埠，其他一律拒絕。這是唯一有效的方法，閘道自己擋不了繞道。
 
 ### Kong 做不到、要誰做
 
@@ -146,6 +150,8 @@ consumers:
 
 **情境**：維修系統（工務／機務，Maximo 7.6 跑在 WebSphere + IHS）把工單完工成本、物料領用、資產異動送會計；會計把成本中心、科目、預算餘額給維修系統下單前檢核。
 
+**影響**：迴圈＝資料重複與帳務錯亂；爆量＝凌晨後端當機；允許清單＝介接上線延期（要重建 jar）；舊 TLS＝閘道連不上後端。
+
 ### 會遇到的問題
 
 - 迴圈：維修系統的 MIF 發布通道推到會計，會計端事件又觸發回推維修系統，資料在兩套 Maximo 之間打轉或重複。
@@ -156,12 +162,12 @@ consumers:
 
 ### Kong 怎麼應對
 
-- **方向分開**：維修系統→會計 與 會計→維修系統各自獨立 Service／Route／consumer，路徑前綴 `/mmis/…` 與 `/aa/…`；correlation-id 全域插件產生的 ID 兩邊都寫進 log，迴圈時一眼看出來源。
-- **迴圈斷點**：request-transformer 對維修系統方向加 `X-Source-System: mmis`；會計端規則「來源＝維修系統的異動不回推」。閘道給標記，後端做判斷。
-- **推送限流**：維修系統 consumer 掛滑動視窗限流（例如 600／分），超額回 429 而不是讓它逾時。MIF 收到明確的 4xx 會把訊息留在錯誤佇列等重送，不會同一筆送兩次；逾時才會。
-- **標頭補正是過渡**：request-transformer 對維修系統方向的 Route 設 Host／Referer／Origin 為允許清單接受的值可先通；正解是請維修系統把 Kong DP 的出口 IP 加進允許清單並拿掉標頭檢查。這件事要在介接設計階段就提出，因為要重建 jar。
-- **後端憑證**：Service 設 `tls_verify: true` 與 `ca_certificates` 指向 IHS 的鏈；對方只有 TLS 1.0／1.1 時 Kong 3.x 預設不談，要求 IHS 升到 1.2，不在閘道降級。
-- **附件**：獨立路由、request-size-limiting 放大、read_timeout 拉長、不掛任何 body 轉換；或只傳附件連結由會計端拉取。
+- `標準` **方向分開**：維修系統→會計 與 會計→維修系統各自獨立 Service／Route／consumer，路徑前綴 `/mmis/…` 與 `/aa/…`；correlation-id 全域插件產生的 ID 兩邊都寫進 log，迴圈時一眼看出來源。
+- `標準` `客製` **迴圈斷點**：request-transformer 對維修系統方向加 `X-Source-System: mmis`；會計端規則「來源＝維修系統的異動不回推」。閘道給標記，後端做判斷。
+- `標準` **推送限流**：維修系統 consumer 掛滑動視窗限流（例如 600／分），超額回 429 而不是讓它逾時。MIF 收到明確的 4xx 會把訊息留在錯誤佇列等重送，不會同一筆送兩次；逾時才會。
+- `標準` `客製` **標頭補正是過渡**：request-transformer 對維修系統方向的 Route 設 Host／Referer／Origin 為允許清單接受的值可先通；正解是請維修系統把 Kong DP 的出口 IP 加進允許清單並拿掉標頭檢查。這件事要在介接設計階段就提出，因為要重建 jar。
+- `標準` **後端憑證**：Service 設 `tls_verify: true` 與 `ca_certificates` 指向 IHS 的鏈；對方只有 TLS 1.0／1.1 時 Kong 3.x 預設不談，要求 IHS 升到 1.2，不在閘道降級。
+- `標準` **附件**：獨立路由、request-size-limiting 放大、read_timeout 拉長、不掛任何 body 轉換；或只傳附件連結由會計端拉取。
 
 ### Kong 做不到、要誰做
 
@@ -189,6 +195,8 @@ plugins:
 
 **情境**：每日 00:30 把出勤、加班、差勤結果送會計算薪資成本與加班費分攤；會計核算完回呼排班系統更新狀態；排班系統下單前查會計的成本中心。
 
+**影響**：爆量＝薪資批次延誤；偽造回呼＝狀態被竄改；亂序＝舊狀態覆蓋新狀態；檔案介接＝完全不留痕。
+
 ### 會遇到的問題
 
 - 爆量：全公司資料同一分鐘湧入，跟票務 00:00 的批次撞在一起。
@@ -198,10 +206,10 @@ plugins:
 
 ### Kong 怎麼應對
 
-- **限流 + 分批**：排班 consumer 限流視窗（例如 300／分）、request-size-limiting；要求分頁 500 筆／批。
-- **回呼簽章**：hmac-auth（OSS）驗 `Date` 與 `Digest` 簽章，`clock_skew 300` 防重放，`validate_request_body` 確保 body 沒被改；再加 ip-restriction 只允許排班系統網段。
-- **快取**：成本中心／科目查詢 proxy-cache 10 分鐘，擋掉下單前的重複查詢。
-- **冪等與順序**：同 14.1 的 Idempotency-Key；順序由 payload 內的版本號或時間戳在後端比對，閘道不保證順序。
+- `標準` **限流 + 分批**：排班 consumer 限流視窗（例如 300／分）、request-size-limiting；要求分頁 500 筆／批。
+- `標準` **回呼簽章**：hmac-auth（OSS）驗 `Date` 與 `Digest` 簽章，`clock_skew 300` 防重放，`validate_request_body` 確保 body 沒被改；再加 ip-restriction 只允許排班系統網段。
+- `標準` **快取**：成本中心／科目查詢 proxy-cache 10 分鐘，擋掉下單前的重複查詢。
+- `客製` **冪等與順序**：同 14.1 的 Idempotency-Key；順序由 payload 內的版本號或時間戳在後端比對，閘道不保證順序。
 
 ### Kong 做不到、要誰做
 
@@ -232,6 +240,8 @@ routes:
 
 **情境**：入站有其他運輸業者的聯運分帳查詢、主計與審計機關的查核資料；出站有會計向銀行付款與對帳、向電子發票平台上傳、向主計系統申報。
 
+**影響**：來源不可控＝資安事件；沒留痕＝對帳爭議沒有證據；環境混淆＝測試資料送進對方正式；對方停機＝整晚批次跑不完。
+
 ### 會遇到的問題
 
 - 入站來源不可控：掃描、暴力嘗試、畸形 payload。
@@ -242,11 +252,11 @@ routes:
 
 ### Kong 怎麼應對
 
-- **入站**：WAF 先擋 OWASP；Kong 每機關一個 consumer，key-auth 或 mtls-auth `Enterprise`（對方憑證的 CA 匯入）、acl、request-validator `Enterprise` 依 OpenAPI 擋畸形 payload、rate-limiting、回應遮罩（response-transformer-advanced／jq 對身分證欄位保留末 4 碼）。
-- **出站也走閘道**：會計 → Kong Route `/egress/einvoice` → Service 指向外部網址；Service 設 `client_certificate`（mTLS）、`tls_verify` 與 `ca_certificates`、逾時 10 秒、`retries: 0`；全部進 http-log。這樣「打了什麼、多久、失敗多少」有單一紀錄，憑證也只放閘道。
-- **固定出口 IP**：OCP EgressIP 綁在 Kong DP 的命名空間，對方白名單只填這一個 IP。
-- **環境隔離**：正式與測試各自一組 CP／DP，外部 Service 的網址在各環境目錄分開宣告，decK 不可能把測試設定 sync 到正式。
-- **對方停機**：外部端點通常不建 Upstream 做主動探測（對方不歡迎），改用被動：http-log 的 `upstream_status` 連續 5xx 觸發告警，並讓批次排程看到 502／504 就退避（例如 15 分鐘後再試），而不是逐筆等逾時。需要真正斷路時再建 Upstream 加被動健康檢查並設 `host_header`。
+- `標準` **入站**：WAF 先擋 OWASP；Kong 每機關一個 consumer，key-auth 或 mtls-auth `Enterprise`（對方憑證的 CA 匯入）、acl、request-validator `Enterprise` 依 OpenAPI 擋畸形 payload、rate-limiting、回應遮罩（response-transformer-advanced／jq 對身分證欄位保留末 4 碼）。
+- `標準` **出站也走閘道**：會計 → Kong Route `/egress/einvoice` → Service 指向外部網址；Service 設 `client_certificate`（mTLS）、`tls_verify` 與 `ca_certificates`、逾時 10 秒、`retries: 0`；全部進 http-log。這樣「打了什麼、多久、失敗多少」有單一紀錄，憑證也只放閘道。
+- `客製` **固定出口 IP**：OCP EgressIP 綁在 Kong DP 的命名空間，對方白名單只填這一個 IP。
+- `標準` **環境隔離**：正式與測試各自一組 CP／DP，外部 Service 的網址在各環境目錄分開宣告，decK 不可能把測試設定 sync 到正式。
+- `標準` `客製` **對方停機**：外部端點通常不建 Upstream 做主動探測（對方不歡迎），改用被動：http-log 的 `upstream_status` 連續 5xx 觸發告警，並讓批次排程看到 502／504 就退避（例如 15 分鐘後再試），而不是逐筆等逾時。需要真正斷路時再建 Upstream 加被動健康檢查並設 `host_header`。
 
 ### Kong 做不到、要誰做
 
